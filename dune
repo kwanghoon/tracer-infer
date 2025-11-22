@@ -1,0 +1,4 @@
+(executable
+ (name tracer_list)
+ (modules tracer_list list_signatures)
+ (libraries yojson unix))
