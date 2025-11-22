@@ -686,26 +686,89 @@ Tracer는 알려진 취약점의 trace를 시그니처로 저장하여 재사용
 
 #### Trace Element 타입
 
-Infer의 `APIMisuseTrace.ml`에서 정의된 trace element:
+Infer의 `APIMisuseTrace.ml`에서 정의된 trace element와 trace 타입:
 
 ```ocaml
+(* 단일 Trace Element 타입 *)
 type elem =
-  | SymbolDecl of AbsLoc.Loc.t
-  | Input of Procname.t * Location.t          (* 외부 입력 *)
-  | Store of Exp.t * Exp.t * Location.t       (* 변수 할당 *)
-  | Prune of Exp.t * Location.t               (* 조건 분기 *)
+  | SymbolDecl of AbsLoc.Loc.t                (* 심볼 선언 *)
+  | Input of Procname.t * Location.t          (* 외부 입력: fread, getenv 등 *)
+  | Store of Exp.t * Exp.t * Location.t       (* 변수 할당: lhs = rhs *)
+  | Prune of Exp.t * Location.t               (* 조건 분기: if, while 등 *)
   | Call of Procname.t * Location.t           (* 함수 호출 *)
-  | LibraryCall of Procname.t * Exp.t list * Location.t
-  | IntOverflow of Procname.t * Exp.t * Location.t
-  | IntUnderflow of Procname.t * Exp.t * Location.t
-  | FormatString of Procname.t * Exp.t * Location.t
-  | CmdInjection of Procname.t * Exp.t * Location.t
-  | BufferOverflow of Procname.t * Exp.t * Location.t
-  | Allocate of Procname.t * Location.t       (* 메모리 할당 *)
-  | Free of Procname.t * Exp.t * Location.t  (* 메모리 해제 *)
+  | LibraryCall of Procname.t * Exp.t list * Location.t  (* 라이브러리 호출 *)
+  | IntOverflow of Procname.t * Exp.t * Location.t       (* 정수 오버플로우 *)
+  | IntUnderflow of Procname.t * Exp.t * Location.t      (* 정수 언더플로우 *)
+  | FormatString of Procname.t * Exp.t * Location.t      (* 포맷 스트링 취약점 *)
+  | CmdInjection of Procname.t * Exp.t * Location.t      (* 명령어 인젝션 *)
+  | BufferOverflow of Procname.t * Exp.t * Location.t    (* 버퍼 오버플로우 *)
+  | Allocate of Procname.t * Location.t       (* 메모리 할당: malloc, new 등 *)
+  | Free of Procname.t * Exp.t * Location.t  (* 메모리 해제: free, delete 등 *)
+[@@deriving compare, yojson_of]
+
+(* Trace는 elem의 리스트 *)
+type t = elem list [@@deriving compare]
 ```
 
-### 8.2 Trace 패턴 정규화
+**Trace 타입의 특징**:
+- **`t = elem list`**: Trace는 trace element들의 순서 있는 리스트
+- **`[@@deriving compare]`**: 두 trace를 비교 가능 (유사도 계산에 사용)
+- **`[@@deriving yojson_of]`**: elem을 JSON으로 직렬화 가능 (signature DB 저장)
+
+**Trace 기본 연산**:
+
+```ocaml
+module Trace = struct
+  type t = elem list
+  
+  let length = List.length                    (* trace 길이 *)
+  let append h t = h :: t                     (* 앞에 element 추가 *)
+  let concat t1 t2 = List.rev_append (List.rev t1) t2  (* 두 trace 연결 *)
+  let make_singleton elem = [elem]            (* 단일 element로 trace 생성 *)
+end
+```
+
+### 8.2 Trace Set과 집합 연산
+
+여러 trace를 관리하기 위한 집합 타입:
+
+```ocaml
+module Set = struct
+  include AbstractDomain.FiniteSet (Trace)
+  
+  type t = Trace.t set  (* Trace들의 집합 *)
+  
+  (* 집합 연산 *)
+  let add : Trace.t -> t -> t           (* trace 추가 *)
+  let join : t -> t -> t                (* 합집합 *)
+  let append : elem -> t -> t           (* 모든 trace에 element 추가 *)
+  let concat : t -> t -> t              (* 두 집합의 trace들을 연결 *)
+  
+  (* 최대 크기 제한 (성능 최적화) *)
+  let max_trace_set_size = Config.api_misuse_max_trace_set
+  let max_trace_length = Config.api_misuse_max_trace_length
+  
+  (* Errlog 변환 *)
+  let make_err_trace : t -> Errlog.LTRSet.t
+end
+```
+
+**사용 예시**:
+
+```ocaml
+(* 단일 trace *)
+let trace1 = [Input (fread, loc1); Store (x, data, loc2); Allocate (malloc, loc3)]
+
+(* Trace set *)
+let traces = Set.empty 
+  |> Set.add trace1 
+  |> Set.add trace2
+  
+(* 모든 trace에 새 element 추가 *)
+let extended = Set.append (Call (process, loc4)) traces
+```
+
+### 8.3 Trace 패턴 정규화
 
 구조적 유사도를 계산하기 위해 trace를 정규화된 패턴으로 변환합니다.
 
@@ -755,7 +818,7 @@ let normalize_trace trace =
   List.map normalize_elem trace
 ```
 
-### 8.3 구조적 유사도 계산
+### 8.4 구조적 유사도 계산
 
 #### 유사도 메트릭
 
@@ -856,7 +919,7 @@ INPUT[read] → CONVERT[bitwise] → MULTIPLY[*] → ALLOCATE[malloc] → USE
 - 패턴 1 vs 패턴 2: 0.98 (할당 함수만 다름)
 - 패턴 1 vs 패턴 3: 0.96 (입력/변환 방법 다름, 논문 결과와 일치)
 
-### 8.4 부분 매칭 (Partial Matching)
+### 8.5 부분 매칭 (Partial Matching)
 
 전체 trace가 일치하지 않아도 중요 서브시퀀스 매칭:
 
@@ -883,7 +946,7 @@ let partial_similarity trace1 trace2 =
   float_of_int lcs_len /. float_of_int min_len
 ```
 
-### 8.5 시그니처 매칭 파이프라인
+### 8.6 시그니처 매칭 파이프라인
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -923,7 +986,7 @@ let partial_similarity trace1 trace2 =
 └──────────────────────────────────────────────┘
 ```
 
-### 8.6 최적화 기법
+### 8.7 최적화 기법
 
 #### 인덱싱
 
@@ -958,7 +1021,7 @@ let quick_filter trace1 trace2 threshold =
     Some (compute_full_similarity trace1 trace2)
 ```
 
-### 8.7 실제 사용 예시
+### 8.8 실제 사용 예시
 
 ```bash
 # 1. Tracer 실행하여 trace 추출
