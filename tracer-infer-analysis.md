@@ -640,7 +640,342 @@ cat infer-out/report.json
 infer explore --select 0
 ```
 
-## 8. 주요 참고 자료
+## 8. Signature Database와 Trace 유사도 계산
+
+### 8.1 Signature Database 구조
+
+Tracer는 알려진 취약점의 trace를 시그니처로 저장하여 재사용합니다. `signature-db` 디렉토리에는 JSON 형식의 취약점 시그니처가 저장됩니다.
+
+#### Trace JSON 형식
+
+```json
+{
+  "trace": [
+    {
+      "type": "Input",
+      "procname": "fread",
+      "location": {"file": "example.c", "line": 10}
+    },
+    {
+      "type": "Store", 
+      "lhs": "buffer",
+      "rhs": "data",
+      "location": {"file": "example.c", "line": 11}
+    },
+    {
+      "type": "Call",
+      "procname": "ToL",
+      "location": {"file": "example.c", "line": 12}
+    },
+    {
+      "type": "IntOverflow",
+      "procname": "operator*",
+      "expression": "width * height",
+      "location": {"file": "example.c", "line": 15}
+    },
+    {
+      "type": "Allocate",
+      "procname": "malloc",
+      "location": {"file": "example.c", "line": 16}
+    }
+  ],
+  "vulnerability": "CVE-2009-1570",
+  "description": "Integer overflow leading to heap buffer overflow"
+}
+```
+
+#### Trace Element 타입
+
+Infer의 `APIMisuseTrace.ml`에서 정의된 trace element:
+
+```ocaml
+type elem =
+  | SymbolDecl of AbsLoc.Loc.t
+  | Input of Procname.t * Location.t          (* 외부 입력 *)
+  | Store of Exp.t * Exp.t * Location.t       (* 변수 할당 *)
+  | Prune of Exp.t * Location.t               (* 조건 분기 *)
+  | Call of Procname.t * Location.t           (* 함수 호출 *)
+  | LibraryCall of Procname.t * Exp.t list * Location.t
+  | IntOverflow of Procname.t * Exp.t * Location.t
+  | IntUnderflow of Procname.t * Exp.t * Location.t
+  | FormatString of Procname.t * Exp.t * Location.t
+  | CmdInjection of Procname.t * Exp.t * Location.t
+  | BufferOverflow of Procname.t * Exp.t * Location.t
+  | Allocate of Procname.t * Location.t       (* 메모리 할당 *)
+  | Free of Procname.t * Exp.t * Location.t  (* 메모리 해제 *)
+```
+
+### 8.2 Trace 패턴 정규화
+
+구조적 유사도를 계산하기 위해 trace를 정규화된 패턴으로 변환합니다.
+
+#### 정규화 과정
+
+1. **구체적 정보 제거**
+   - 변수명, 파일명, 라인 번호 제거
+   - 함수명을 추상화 (예: `fread` → `FILE_READ`)
+
+2. **타입 기반 추상화**
+   ```
+   원본: Input("fread", location)
+   패턴: INPUT
+   
+   원본: Call("ToL", location)  
+   패턴: CALL[TYPE_CONVERSION]
+   
+   원본: IntOverflow("operator*", "width*height", location)
+   패턴: INT_OVERFLOW[MULTIPLY]
+   
+   원본: Allocate("malloc", location)
+   패턴: ALLOCATE
+   ```
+
+3. **시퀀스 패턴 생성**
+   ```
+   전체 패턴: INPUT → CALL → INT_OVERFLOW → ALLOCATE
+   ```
+
+#### 정규화 알고리즘 (의사 코드)
+
+```ocaml
+let normalize_trace trace =
+  let normalize_elem = function
+    | Input (_, _) -> 
+        Abstract_Input
+    | Call (pname, _) -> 
+        Abstract_Call (categorize_function pname)
+    | IntOverflow (_, exp, _) -> 
+        Abstract_IntOverflow (get_operator_type exp)
+    | Allocate (_, _) -> 
+        Abstract_Allocate
+    | Store (lhs, rhs, _) -> 
+        Abstract_Store (get_value_type lhs, get_value_type rhs)
+    (* ... 기타 타입 ... *)
+  in
+  List.map normalize_elem trace
+```
+
+### 8.3 구조적 유사도 계산
+
+#### 유사도 메트릭
+
+Tracer는 **편집 거리(Edit Distance)** 기반 유사도를 사용합니다.
+
+##### 1. Levenshtein Distance 변형
+
+두 trace 패턴 간의 최소 변환 횟수를 계산:
+
+```ocaml
+type operation = 
+  | Insert of elem
+  | Delete of elem  
+  | Substitute of elem * elem
+  | Match of elem
+
+let edit_distance trace1 trace2 =
+  (* 동적 프로그래밍으로 최소 편집 거리 계산 *)
+  let len1 = List.length trace1 in
+  let len2 = List.length trace2 in
+  let dp = Array.make_matrix (len1 + 1) (len2 + 1) 0 in
+  
+  (* 초기화 *)
+  for i = 0 to len1 do dp.(i).(0) <- i done;
+  for j = 0 to len2 do dp.(0).(j) <- j done;
+  
+  (* 동적 프로그래밍 *)
+  for i = 1 to len1 do
+    for j = 1 to len2 do
+      let cost = if elem_equal trace1.(i-1) trace2.(j-1) then 0 else 1 in
+      dp.(i).(j) <- min (min 
+        (dp.(i-1).(j) + 1)      (* 삭제 *)
+        (dp.(i).(j-1) + 1))     (* 삽입 *)
+        (dp.(i-1).(j-1) + cost) (* 치환 또는 매치 *)
+    done
+  done;
+  dp.(len1).(len2)
+```
+
+##### 2. 유사도 점수 계산
+
+```ocaml
+let similarity_score trace1 trace2 =
+  let distance = edit_distance trace1 trace2 in
+  let max_len = max (List.length trace1) (List.length trace2) in
+  1.0 -. (float_of_int distance /. float_of_int max_len)
+```
+
+**예시**:
+- CVE-2009-1570: `INPUT → CONVERT → MULTIPLY → ALLOCATE → USE`
+- CVE-2017-16612: `INPUT → CONVERT → MULTIPLY → ALLOCATE → USE`
+- 편집 거리: 0
+- 유사도: 1.0 (완전 일치)
+
+##### 3. 가중치 기반 유사도
+
+중요한 요소에 가중치 부여:
+
+```ocaml
+let weighted_similarity trace1 trace2 =
+  let elem_weight = function
+    | Abstract_Input -> 2.0
+    | Abstract_IntOverflow _ -> 3.0  (* 핵심 취약점 *)
+    | Abstract_Allocate -> 2.0
+    | Abstract_Call _ -> 1.0
+    | _ -> 1.0
+  in
+  
+  let weighted_distance = 
+    compute_weighted_edit_distance trace1 trace2 elem_weight
+  in
+  
+  let total_weight = 
+    List.fold_left (fun acc elem -> acc +. elem_weight elem) 0.0 trace1
+  in
+  
+  1.0 -. (weighted_distance /. total_weight)
+```
+
+#### 유사도 예시
+
+**패턴 1** (gimp-2.6.7, CVE-2009-1570):
+```
+INPUT[fread] → CONVERT[ToL] → MULTIPLY[*] → ALLOCATE[malloc] → USE
+```
+
+**패턴 2** (sam2p-0.49.4, CVE-2017-16663):
+```
+INPUT[fread] → CONVERT[ToL] → MULTIPLY[*] → ALLOCATE[new] → USE
+```
+
+**패턴 3** (libXcursor-1.1.14, CVE-2017-16612):
+```
+INPUT[read] → CONVERT[bitwise] → MULTIPLY[*] → ALLOCATE[malloc] → USE
+```
+
+**유사도 계산**:
+- 패턴 1 vs 패턴 2: 0.98 (할당 함수만 다름)
+- 패턴 1 vs 패턴 3: 0.96 (입력/변환 방법 다름, 논문 결과와 일치)
+
+### 8.4 부분 매칭 (Partial Matching)
+
+전체 trace가 일치하지 않아도 중요 서브시퀀스 매칭:
+
+```ocaml
+let find_longest_common_subsequence trace1 trace2 =
+  (* LCS 알고리즘으로 공통 부분 시퀀스 찾기 *)
+  let len1 = List.length trace1 in
+  let len2 = List.length trace2 in
+  let dp = Array.make_matrix (len1 + 1) (len2 + 1) 0 in
+  
+  for i = 1 to len1 do
+    for j = 1 to len2 do
+      if elem_equal trace1.(i-1) trace2.(j-1) then
+        dp.(i).(j) <- dp.(i-1).(j-1) + 1
+      else
+        dp.(i).(j) <- max dp.(i-1).(j) dp.(i).(j-1)
+    done
+  done;
+  dp.(len1).(len2)
+
+let partial_similarity trace1 trace2 =
+  let lcs_len = find_longest_common_subsequence trace1 trace2 in
+  let min_len = min (List.length trace1) (List.length trace2) in
+  float_of_int lcs_len /. float_of_int min_len
+```
+
+### 8.5 시그니처 매칭 파이프라인
+
+```
+┌──────────────────────────────────────────────┐
+│ 1. Taint 분석 실행                            │
+│    - Quandary로 Source → Sink 경로 탐지       │
+│    - Trace 추출                               │
+└────────────┬─────────────────────────────────┘
+             │
+             ↓
+┌──────────────────────────────────────────────┐
+│ 2. Trace 정규화                              │
+│    - 구체적 정보 제거                         │
+│    - 추상 패턴 생성                           │
+└────────────┬─────────────────────────────────┘
+             │
+             ↓
+┌──────────────────────────────────────────────┐
+│ 3. Signature DB 로드                         │
+│    - JSON 파일들 파싱                         │
+│    - 알려진 취약점 패턴 추출                  │
+└────────────┬─────────────────────────────────┘
+             │
+             ↓
+┌──────────────────────────────────────────────┐
+│ 4. 유사도 계산                                │
+│    - 각 시그니처와 비교                       │
+│    - 편집 거리 계산                           │
+│    - 가중치 적용                              │
+└────────────┬─────────────────────────────────┘
+             │
+             ↓
+┌──────────────────────────────────────────────┐
+│ 5. 랭킹 및 보고                               │
+│    - 유사도 점수로 정렬                       │
+│    - 임계값 이상만 보고                       │
+│    - CVE 정보와 함께 출력                     │
+└──────────────────────────────────────────────┘
+```
+
+### 8.6 최적화 기법
+
+#### 인덱싱
+
+```ocaml
+(* Trace 시작 패턴으로 인덱싱 *)
+type trace_index = (abstract_elem list, signature list) Hashtbl.t
+
+let build_index signatures =
+  let index = Hashtbl.create 1000 in
+  List.iter (fun sig ->
+    let prefix = take 3 sig.normalized_trace in  (* 첫 3개 요소 *)
+    let existing = Hashtbl.find_opt index prefix |> Option.value ~default:[] in
+    Hashtbl.replace index prefix (sig :: existing)
+  ) signatures;
+  index
+
+let find_candidates index query_trace =
+  let prefix = take 3 query_trace in
+  Hashtbl.find_opt index prefix |> Option.value ~default:[]
+```
+
+#### 조기 종료
+
+```ocaml
+let quick_filter trace1 trace2 threshold =
+  (* 길이 차이가 너무 크면 조기 종료 *)
+  let len_diff = abs (List.length trace1 - List.length trace2) in
+  let max_len = max (List.length trace1) (List.length trace2) in
+  if float_of_int len_diff /. float_of_int max_len > (1.0 -. threshold) then
+    None  (* 임계값 이하 확정 *)
+  else
+    Some (compute_full_similarity trace1 trace2)
+```
+
+### 8.7 실제 사용 예시
+
+```bash
+# 1. Tracer 실행하여 trace 추출
+./tracer analyze target_program.c
+
+# 2. Signature DB와 비교
+./tracer match --db signature-db/ --threshold 0.85
+
+# 3. 결과 출력
+# Match found!
+# Query trace: INPUT → CONVERT → MULTIPLY → ALLOCATE
+# Similar to: CVE-2009-1570 (gimp-2.6.7)
+# Similarity: 0.96
+# Description: Integer overflow leading to heap buffer overflow
+```
+
+## 9. 주요 참고 자료
 
 ### 논문
 - **Tracer: Signature-based Static Analysis for Detecting Recurring Vulnerabilities**
